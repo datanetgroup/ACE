@@ -1,0 +1,11 @@
+﻿{
+  "id": "cxx.gamemode",
+  "displayName": "C++ Class: GameMode",
+  "category": "C++ Class",
+  "files": [
+    { "output": "Source/{{ClassName}}.h",  "template": "<ACE>/Templates/FileTemplates/Cxx/ClassHeader.h.tmpl" },
+    { "output": "Source/{{ClassName}}.cpp","template": "<ACE>/Templates/FileTemplates/Cxx/ClassSource.cpp.tmpl" }
+  ],
+  "defaults": { "Namespace": "Game" },
+  "varsFromDialog": ["Namespace"]
+}
