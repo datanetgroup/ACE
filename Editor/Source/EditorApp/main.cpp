@@ -24,8 +24,12 @@
 #include <cstdarg>
 #include <ctime>
 #include <thread>
+
 #include "EditorSettingsPanel.h"
 #include "EditorCodegen.h"
+#include "UI/Themes/ThemeManager.h"
+#include "EditorPreferences.h"
+#include "TextEditor.h"
 
 #include <GLFW/glfw3.h>
 #ifdef _WIN32
@@ -37,7 +41,7 @@
 #include <GL/gl.h>
 
 // Enable ImVec2 operators like +, -, * before including imgui.h
-#define IMGUI_DEFINE_MATH_OPERATORS
+
 #include "imgui.h"
 #include "imgui_internal.h"
 #include "backends/imgui_impl_glfw.h"
@@ -62,6 +66,34 @@ using json = nlohmann::json;
 #endif
 
 // ---------- Helpers ----------
+
+static TextEditor::LanguageDefinition LangForPath(const std::filesystem::path& p)
+{
+    using LD = TextEditor::LanguageDefinition;
+    std::string ext = p.has_extension() ? p.extension().string() : "";
+    // make lowercase without extra deps
+    for (char& c : ext) c = (char)std::tolower((unsigned char)c);
+
+    if (ext == ".c")
+        return LD::C();
+
+    if (ext == ".cpp" || ext == ".cc" || ext == ".cxx" ||
+        ext == ".hpp" || ext == ".hh" || ext == ".hxx" ||
+        ext == ".h"   || ext == ".inl")
+        return LD::CPlusPlus();
+
+    if (ext == ".glsl" || ext == ".vert" || ext == ".frag" ||
+        ext == ".geom" || ext == ".tesc" || ext == ".tese" ||
+        ext == ".comp")
+        return LD::GLSL();
+
+    if (ext == ".hlsl" || ext == ".fx")
+        return LD::HLSL();
+
+    // Fallback for things like .json, .ini, .py, etc.
+    return LD::CPlusPlus();
+}
+
 
 static std::string CanonicalStr(const std::filesystem::path& p) {
     std::error_code ec;
@@ -348,8 +380,9 @@ struct EditorTab {
 
     // Text
     std::string Buffer;
-    bool Dirty = false;
+    bool Dirty    = false;
     bool ReadOnly = false;
+    std::unique_ptr<TextEditor> Code;  // syntax-highlighting editor instance
 
     // Blueprint
     bp::Graph BPGraph;
@@ -357,6 +390,7 @@ struct EditorTab {
     bool      BPLoaded = false;
     bool      BPDirty  = false;
 };
+
 
 // ---------- Editor World / Map types (minimal) ----------
 
@@ -1605,41 +1639,35 @@ static void DrawPanel_Editors(EditorState& S) {
     if (!S.P.Editors) return;
 
     // ---------------- Focus/visibility control (fixes popup blocking) ----------------
-    // We only request focus once on meaningful events (new tab, tab switch, explicit FocusNewTab).
-    // Never re-focus every frame while tabs exist (that prevents other popups/menus).
     static bool s_shown_once = false;
     static int  s_last_tab_count = -1;
     static int  s_last_active_tab = -999;
     static bool s_request_focus = false;
 
-    const int  tab_count  = (int)S.Tabs.size();
-    const bool has_tabs   = tab_count > 0;
-    const bool new_tab    = (tab_count > s_last_tab_count);
+    const int  tab_count   = (int)S.Tabs.size();
+    const bool has_tabs    = tab_count > 0;
+    const bool new_tab     = (tab_count > s_last_tab_count);
     const bool tab_switched = (S.ActiveTab != s_last_active_tab && S.ActiveTab >= 0);
 
     if (S.FocusNewTab || new_tab || tab_switched || !s_shown_once) {
-        // Only focus on true change; don't spam every frame.
         s_request_focus = S.FocusNewTab || new_tab || tab_switched;
-        // Make sure the window is uncollapsed at least once.
         ImGui::SetNextWindowCollapsed(false, ImGuiCond_Once);
         if (s_request_focus) {
-            ImGui::SetNextWindowFocus();           // one-shot focus request
+            ImGui::SetNextWindowFocus();
         }
         ImGui::SetNextWindowSize(ImVec2(900.0f, 600.0f), ImGuiCond_FirstUseEver);
     }
 
     if (!ImGui::Begin("Editors", &S.P.Editors)) {
-        // When hidden/collapsed, clear one-shot so we don't keep stealing focus.
         s_request_focus = false;
         ImGui::End();
         return;
     }
     s_shown_once = true;
 
-    // Keep ActiveTab valid when tabs exist
     if (has_tabs && (S.ActiveTab < 0 || S.ActiveTab >= tab_count)) {
         S.ActiveTab = 0;
-        S.FocusNewTab = true;      // trigger a one-shot focus on next frame
+        S.FocusNewTab = true;
     }
 
     // ---------------- Toolbar for active tab ----------------
@@ -1648,12 +1676,17 @@ static void DrawPanel_Editors(EditorState& S) {
 
         if (tab.Type == EditorTabType::Text) {
             if (ImGui::Button("Save (Ctrl+S)")) {
+                if (tab.Code) tab.Buffer = tab.Code->GetText();
                 if (SaveStringToFile(tab.Path, tab.Buffer)) tab.Dirty = false;
             }
             ImGui::SameLine();
             if (ImGui::Button("Reload")) {
                 std::string tmp;
-                if (LoadFileToString(tab.Path, tmp)) { tab.Buffer = std::move(tmp); tab.Dirty = false; }
+                if (LoadFileToString(tab.Path, tmp)) {
+                    tab.Buffer = std::move(tmp);
+                    if (tab.Code) tab.Code->SetText(tab.Buffer);
+                    tab.Dirty = false;
+                }
             }
         } else { // Blueprint
             if (ImGui::Button("Save (Ctrl+S)")) {
@@ -1700,6 +1733,7 @@ static void DrawPanel_Editors(EditorState& S) {
             if (S.ActiveTab >= 0 && S.ActiveTab < tab_count) {
                 EditorTab& tab = S.Tabs[S.ActiveTab];
                 if (tab.Type == EditorTabType::Text) {
+                    if (tab.Code) tab.Buffer = tab.Code->GetText();
                     if (SaveStringToFile(tab.Path, tab.Buffer)) tab.Dirty = false;
                 } else {
                     if (SaveBlueprint(tab.Path, tab.BPGraph)) tab.BPDirty = false;
@@ -1721,6 +1755,22 @@ static void DrawPanel_Editors(EditorState& S) {
     if (ImGui::BeginTabBar("EditorsTabs",
         ImGuiTabBarFlags_Reorderable | ImGuiTabBarFlags_TabListPopupButton))
     {
+        // Small helper for language selection based on extension
+        auto LangForPath = [](const std::filesystem::path& p) -> TextEditor::LanguageDefinition {
+            using LD = TextEditor::LanguageDefinition;
+            const std::string ext = p.has_extension() ? p.extension().string() : "";
+            if (ext == ".c") return LD::C();
+            if (ext == ".cpp" || ext == ".cc" || ext == ".cxx" || ext == ".hpp" || ext == ".hh" || ext == ".hxx" || ext == ".h" || ext == ".inl")
+                return LD::CPlusPlus();
+            if (ext == ".glsl" || ext == ".vert" || ext == ".frag" || ext == ".comp" || ext == ".geom")
+                return LD::GLSL();
+            if (ext == ".hlsl" || ext == ".fx")
+                return LD::HLSL();
+            if (ext == ".lua")
+                return LD::Lua();
+            return LD::CPlusPlus();
+        };
+
         int toClose = -1;
         for (int i = 0; i < (int)S.Tabs.size(); ++i) {
             EditorTab& tab = S.Tabs[i];
@@ -1741,9 +1791,24 @@ static void DrawPanel_Editors(EditorState& S) {
                 avail.y = std::max(120.0f, avail.y - 2.0f);
 
                 if (tab.Type == EditorTabType::Text) {
-                    ImGuiInputTextFlags flags =
-                        ImGuiInputTextFlags_AllowTabInput | ImGuiInputTextFlags_CallbackEdit;
-                    if (ImGui::InputTextMultiline("##text", &tab.Buffer, avail, flags)) {
+                    // Lazily construct the syntax-highlighting editor when first shown
+                    if (!tab.Code) {
+                        tab.Code = std::make_unique<TextEditor>();
+                        tab.Code->SetTabSize(4);
+                        tab.Code->SetShowWhitespaces(false);
+                        tab.Code->SetReadOnly(tab.ReadOnly);
+                        tab.Code->SetLanguageDefinition(LangForPath(tab.Path));
+                        tab.Code->SetText(tab.Buffer);
+                        // Apply current theme's code palette
+                        ace::ui::ThemeManager::ApplyTextEditorTheme(*tab.Code);
+                    }
+
+                    // Render the editor
+                    tab.Code->Render("##code", avail, false);
+
+                    // Track changes and sync Buffer for saving
+                    if (tab.Code->IsTextChanged()) {
+                        tab.Buffer = tab.Code->GetText();
                         tab.Dirty = true;
                     }
                 } else {
@@ -1769,8 +1834,9 @@ static void DrawPanel_Editors(EditorState& S) {
     // ---------------- Update one-shot trackers ----------------
     s_last_tab_count  = (int)S.Tabs.size();
     s_last_active_tab = S.ActiveTab;
-    s_request_focus   = false; // consume the one-shot
+    s_request_focus   = false;
 }
+
 
 
 
@@ -3380,7 +3446,9 @@ static void DrawMenus(EditorState& S) {
             ImGui::MenuItem("Console Variables (CVars)", nullptr, Flag_Settings_CVars(),        true);
 
             ImGui::SeparatorText("Editor");
-            ImGui::MenuItem("Editor Preferences...",      nullptr, Flag_EditorPreferences());
+            if (ImGui::MenuItem("Editor Preferences...", "Ctrl+,")) {
+                ace::editor::OpenEditorPreferences();
+            }
             ImGui::MenuItem("Plugins...",                 nullptr, Flag_Plugins());
             ImGui::MenuItem("Source Control",             nullptr, Flag_Settings_SourceControl());
             ImGui::MenuItem("Theme & Layout",             nullptr, Flag_Settings_Appearance());
@@ -3508,7 +3576,31 @@ int main(int argc, char** argv) {
     // keep multi-viewport disabled while docking inside main window
     // io.ConfigFlags |= ImGuiConfigFlags_ViewportsEnable;
 #endif
-    ImGui::StyleColorsDark();
+
+    // ---- ThemeManager (GMS2) hook + optional fonts ----
+    {
+        // Optional: try to load a UI + monospaced font; fall back silently if not found.
+        auto try_font = [&](const std::filesystem::path& p, float px)->ImFont* {
+            std::error_code ec;
+            if (std::filesystem::exists(p, ec)) return io.Fonts->AddFontFromFileTTF(p.string().c_str(), px);
+            return nullptr;
+        };
+
+        const auto exeDir = GetExeDir(); // already provided in this file
+        (void)try_font(exeDir / "Content/Fonts/Inter-Medium.ttf", 16.0f);
+        if (ImFont* mono = try_font(exeDir / "Content/Fonts/JetBrainsMono/JetBrainsMono-Medium.ttf", 15.0f))
+            io.FontDefault = mono; // make editor text mono if present
+
+        // Apply GMS2 theme via ThemeManager
+        ace::ui::ThemeManager::Initialize(ace::ui::ThemeId::GMS2);
+        ace::ui::ThemeManager::ApplyBaseTheme(1.0f);   // palette, spacing, rounding
+        io.ConfigFlags &= ~ImGuiConfigFlags_ViewportsEnable;
+        ace::ui::ThemeManager::ApplyGraphTheme();      // safe no-op if imnodes not present
+        // Note: when you create a TextEditor instance, call:
+        // ace::ui::ThemeManager::ApplyTextEditorTheme(myTextEditor);
+    }
+    // -------------------------------------------
+
     ImGui_ImplGlfw_InitForOpenGL(window, true);
     ImGui_ImplOpenGL2_Init();
 
@@ -3518,9 +3610,15 @@ int main(int argc, char** argv) {
         ImGui_ImplGlfw_NewFrame();
         ImGui::NewFrame();
 
+        // If your DrawDockspace() already sets up the dockspace, keep it:
         DrawDockspace(S);
+        // (Alternative: use the theme's dock host)
+        // ace::ui::ThemeManager::BeginMainDockspace("ACE Editor");
+
         DrawMenus(S);
         DrawPanels(S);
+
+        ace::editor::DrawEditorPreferences(S);
 
         ImGui::Render();
         int w, h; glfwGetFramebufferSize(window, &w, &h);
@@ -3528,6 +3626,12 @@ int main(int argc, char** argv) {
         glClearColor(0.12f, 0.12f, 0.12f, 1.0f);
         glClear(GL_COLOR_BUFFER_BIT);
         ImGui_ImplOpenGL2_RenderDrawData(ImGui::GetDrawData());
+        if (io.ConfigFlags & ImGuiConfigFlags_ViewportsEnable) {
+            GLFWwindow* backup_ctx = glfwGetCurrentContext();
+            ImGui::UpdatePlatformWindows();
+            ImGui::RenderPlatformWindowsDefault();
+            glfwMakeContextCurrent(backup_ctx);
+        }
         glfwSwapBuffers(window);
     }
 
@@ -3538,3 +3642,4 @@ int main(int argc, char** argv) {
     glfwTerminate();
     return 0;
 }
+
